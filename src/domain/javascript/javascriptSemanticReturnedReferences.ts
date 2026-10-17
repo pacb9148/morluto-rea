@@ -13,7 +13,6 @@ import {
 import {
   resolveSemanticBindingState,
   type JavaScriptSemanticAnalysisState,
-  type JavaScriptSemanticInitializer,
 } from "./javascriptSemanticState.js";
 
 /** A reference potentially handed to a caller or generator consumer. */
@@ -22,75 +21,24 @@ export interface SemanticReturnedReference {
   readonly projection: JavaScriptSemanticPropertyPath;
 }
 
+/**
+ * Capping the accumulated projection keeps alias cycles with projecting
+ * initializers finite; no real bundle projects anywhere near this depth.
+ */
+const maxProjectionEntries = 128;
+
+/**
+ * Expansions allowed per callee before the walk degrades to unknown-projection
+ * navigation. Dense alias clusters with projecting initializers can carry
+ * exponentially many distinct projections; the degradation keeps those
+ * clusters bounded while every reachable function is still reported.
+ */
+const maxExpansionsPerCallee = 20_000;
+
 interface Candidate {
   readonly node: t.Node;
   readonly path: readonly (string | number | null)[];
-  readonly initializers: ReadonlySet<JavaScriptSemanticInitializer>;
 }
-
-type InitializerContext = ReadonlySet<JavaScriptSemanticInitializer>;
-type CompletedExpansions = WeakMap<
-  t.Node,
-  Map<string, readonly InitializerContext[]>
->;
-
-interface ExpansionFrame {
-  readonly item: Candidate;
-  readonly node: t.Node;
-  readonly pathKey: string;
-  readonly parent: ExpansionFrame | null;
-  readonly blockers: Set<JavaScriptSemanticInitializer>;
-}
-
-type ExpansionTask =
-  | {
-      readonly kind: "visit";
-      readonly item: Candidate;
-      readonly parent: ExpansionFrame | null;
-    }
-  | { readonly kind: "complete"; readonly frame: ExpansionFrame };
-
-const contextContains = (
-  context: InitializerContext,
-  required: InitializerContext,
-): boolean => {
-  for (const initializer of required)
-    if (!context.has(initializer)) return false;
-  return true;
-};
-
-const propagateBlockers = (
-  blockers: InitializerContext,
-  parent: ExpansionFrame | null,
-): void => {
-  if (parent === null) return;
-  for (const initializer of blockers)
-    if (parent.item.initializers.has(initializer))
-      parent.blockers.add(initializer);
-};
-
-const completeExpansion = (
-  frame: ExpansionFrame,
-  expanded: CompletedExpansions,
-): void => {
-  const paths =
-    expanded.get(frame.node) ??
-    new Map<string, readonly InitializerContext[]>();
-  const contexts = paths.get(frame.pathKey) ?? [];
-  const covered = contexts.find((context) =>
-    contextContains(frame.blockers, context),
-  );
-  if (covered === undefined) {
-    paths.set(frame.pathKey, [
-      ...contexts.filter(
-        (context) => !contextContains(context, frame.blockers),
-      ),
-      frame.blockers,
-    ]);
-    expanded.set(frame.node, paths);
-  }
-  propagateBlockers(covered ?? frame.blockers, frame.parent);
-};
 
 interface ObjectTargetIndex {
   readonly propertyByName: ReadonlyMap<
@@ -118,45 +66,24 @@ export const createSemanticReturnedReferences = (
     const existing = results.get(callee);
     if (existing !== undefined) return existing;
     const functions = new Set<t.Node>();
-    const work: ExpansionTask[] = [
-      {
-        kind: "visit",
-        item: { node: callee, path: [], initializers: new Set() },
-        parent: null,
-      },
-    ];
-    // Finish descendants before memoizing an expansion. Only actual external
-    // cycle blockers affect reuse; branch history is not a dependency. An
-    // acyclic expression/path is consequently expanded once across a diamond.
-    const expanded: CompletedExpansions = new WeakMap();
-    while (work.length > 0) {
-      const task = work.pop();
-      if (task === undefined) break;
-      if (task.kind === "complete") {
-        completeExpansion(task.frame, expanded);
-        continue;
-      }
-      const { item, parent } = task;
+    // Each expression/projection pair expands exactly once, so alias cycles
+    // cannot multiply the search. Every locally reachable reference is
+    // reported, which stays on the conservative side for escape marking.
+    const expanded = new WeakMap<t.Node, Set<string>>();
+    const pending: Candidate[] = [{ node: callee, path: [] }];
+    let wildcard = false;
+    let expansions = 0;
+    for (let cursor = 0; cursor < pending.length; cursor++) {
+      const item = pending[cursor];
+      if (item === undefined) break;
+      if (!wildcard && ++expansions > maxExpansionsPerCallee) wildcard = true;
       const node = unwrapJavaScriptExpression(item.node).node;
-      const pathKey = JSON.stringify(item.path);
-      const covered = expanded
-        .get(node)
-        ?.get(pathKey)
-        ?.find((context) => contextContains(item.initializers, context));
-      if (covered !== undefined) {
-        // Cached cycle dependencies must reach the caller's proof too.
-        propagateBlockers(covered, parent);
-        continue;
-      }
-      const frame: ExpansionFrame = {
-        item,
-        node,
-        pathKey,
-        parent,
-        blockers: new Set(),
-      };
-      work.push({ kind: "complete", frame });
-      const pending: Candidate[] = [];
+      const projection = wildcard ? [] : item.path;
+      const pathKey = JSON.stringify(projection);
+      const seen = expanded.get(node) ?? new Set<string>();
+      expanded.set(node, seen);
+      if (seen.has(pathKey)) continue;
+      seen.add(pathKey);
       if (t.isIdentifier(node)) {
         const binding = resolveSemanticBindingState(state, node, node.name);
         if (binding === undefined) continue;
@@ -169,27 +96,21 @@ export const createSemanticReturnedReferences = (
           ...selected.initializers,
           ...selected.referenceInitializers,
         ]) {
-          if (item.initializers.has(initializer)) {
-            frame.blockers.add(initializer);
-            continue;
-          }
-          pending.push({
-            node: initializer.node,
-            path: [...initializer.projection, ...item.path],
-            initializers: new Set([...item.initializers, initializer]),
-          });
+          const initializerPath = [...initializer.projection, ...projection];
+          if (initializerPath.length > maxProjectionEntries) continue;
+          pending.push({ node: initializer.node, path: initializerPath });
         }
       } else if (
         t.isMemberExpression(node) ||
         t.isOptionalMemberExpression(node)
       ) {
-        const path: (string | number | null)[] = [];
+        const keys: (string | number | null)[] = [];
         let receiver: t.Node = node;
         while (
           t.isMemberExpression(receiver) ||
           t.isOptionalMemberExpression(receiver)
         ) {
-          path.push(
+          keys.push(
             semanticStaticPropertyKey(receiver.property, receiver.computed),
           );
           receiver = unwrapJavaScriptExpression(receiver.object).node;
@@ -197,7 +118,7 @@ export const createSemanticReturnedReferences = (
         pending.push({
           ...item,
           node: receiver,
-          path: [...path.reverse(), ...item.path],
+          path: [...keys.reverse(), ...projection],
         });
       } else if (
         t.isConditionalExpression(node) ||
@@ -216,12 +137,17 @@ export const createSemanticReturnedReferences = (
       } else if (t.isSequenceExpression(node)) {
         const last = node.expressions.at(-1);
         if (last !== undefined) pending.push({ ...item, node: last });
-      } else if (t.isFunction(node) && item.path.length === 0)
+      } else if (t.isFunction(node) && projection.length === 0)
         functions.add(node);
       else if (t.isObjectExpression(node))
-        selectObjectTargets(node, item, pending, objectTargets);
+        selectObjectTargets(
+          node,
+          { ...item, path: projection },
+          pending,
+          objectTargets,
+        );
       else if (t.isArrayExpression(node)) {
-        const [key, ...path] = item.path;
+        const [key, ...path] = projection;
         const index =
           key === undefined || key === null ? null : semanticArrayIndex(key);
         let uncertainOffset = false;
@@ -240,11 +166,11 @@ export const createSemanticReturnedReferences = (
       } else if (t.isNewExpression(node))
         pending.push({ ...item, node: node.callee });
       else if (t.isClass(node)) {
-        const [key, ...path] = item.path;
+        const [key, ...path] = projection;
         for (const member of node.body.body) {
           if (t.isClassMethod(member)) {
             if (
-              (item.path.length === 0 && member.kind === "constructor") ||
+              (projection.length === 0 && member.kind === "constructor") ||
               (key !== undefined &&
                 (key === null ||
                   semanticStaticPropertyKey(member.key, member.computed) ===
@@ -264,11 +190,6 @@ export const createSemanticReturnedReferences = (
         }
         if (node.superClass !== null && node.superClass !== undefined)
           pending.push({ ...item, node: node.superClass });
-      }
-      for (let index = pending.length - 1; index >= 0; index--) {
-        const child = pending[index];
-        if (child !== undefined)
-          work.push({ kind: "visit", item: child, parent: frame });
       }
     }
     const output = [...functions].flatMap((node) => {

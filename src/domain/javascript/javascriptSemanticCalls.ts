@@ -21,7 +21,9 @@ import {
 import {
   type LocalCallableResolution,
   parameterBindings,
+  createCallResolutionMemory,
   resolveLocalCallables,
+  type CallResolutionMemory,
 } from "./javascriptSemanticCallResolution.js";
 import { traverseJavaScriptAst } from "./javascriptSemanticTraversal.js";
 import { range } from "./javascriptStaticAnalysisHelpers.js";
@@ -54,6 +56,7 @@ interface CallCollectionContext {
     t.Identifier,
     LocalCallableResolution
   >;
+  readonly callResolutionMemory: CallResolutionMemory;
   readonly parameterBindingCache: Map<
     string,
     readonly JavaScriptSemanticBindingState[]
@@ -83,6 +86,7 @@ export const collectJavaScriptSemanticCalls = (
     callableById,
     output,
     bindingResolutionCache: new WeakMap(),
+    callResolutionMemory: createCallResolutionMemory(),
     parameterBindingCache: new Map(),
     ancestors: [],
   };
@@ -130,8 +134,8 @@ const collectCallSite = (
     node: node.callee,
     state,
     callableById,
-    seenInitializers: new Set(),
     bindingCache: context.bindingResolutionCache,
+    resolutionMemory: context.callResolutionMemory,
   });
   const callSiteId = semanticCallSiteId(node);
   const argumentsValue = retainedArguments(node.arguments);

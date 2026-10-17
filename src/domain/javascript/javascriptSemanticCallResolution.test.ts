@@ -32,7 +32,6 @@ const indexed = (source: string) => {
         state,
         callableById,
         bindingCache,
-        seenInitializers: new Set(),
       }),
   };
 };
@@ -80,6 +79,92 @@ it("bounds shared partial callback alias expansion by AST size", () => {
   expect(large.callReads).toBeLessThan(3 * small.callReads);
   expect(small.referenceReads).toBeGreaterThan(0);
   expect(large.referenceReads).toBeLessThan(3 * small.referenceReads);
+});
+
+it("bounds alias-cycle initializer chains to the settled fixpoint", () => {
+  const measure = (writes: number) => {
+    const body = Array.from({ length: writes }, (_, i) =>
+      i % 2 === 0 ? "a = b;" : "b = a;",
+    ).join("");
+    const context = indexed(
+      `function f(){} function g(){} let a = f, b = g; function run() { ${body} a().x = 1; }`,
+    );
+    const run = context.state.program.body[3];
+    if (!t.isFunctionDeclaration(run)) throw new Error("Missing run");
+    const last = run.body.body.at(-1);
+    if (
+      !t.isExpressionStatement(last) ||
+      !t.isAssignmentExpression(last.expression) ||
+      !t.isMemberExpression(last.expression.left) ||
+      !t.isCallExpression(last.expression.left.object)
+    )
+      throw new Error("Missing member mutation");
+    const callee = last.expression.left.object.callee;
+    const lookups = context.state.scopes.map((scope) =>
+      vi.spyOn(scope.bindings, "get"),
+    );
+    try {
+      const result = context.resolve(callee);
+      expect(result.cycleDependent).toBe(true);
+      expect(result.complete).toBe(false);
+      expect(result.callableIds).toHaveLength(2);
+      expect(context.resolve(callee)).toEqual(result);
+      expect(
+        resolveLocalCallables({
+          node: callee,
+          state: context.state,
+          callableById: context.callableById,
+          bindingCache: new WeakMap(),
+        }),
+      ).toEqual(result);
+      return lookups.reduce(
+        (total, lookup) => total + lookup.mock.calls.length,
+        0,
+      );
+    } finally {
+      for (const lookup of lookups) lookup.mockRestore();
+    }
+  };
+  const small = measure(8);
+  const large = measure(12);
+  expect(small).toBeGreaterThan(0);
+  expect(large).toBeLessThan(3 * small);
+});
+
+it("bounds projecting alias-cycle expansion in returned references", () => {
+  const measure = (depth: number) => {
+    const context = indexed(`function target(){return {};}
+function choose(flag){
+  let a0 = {v: target};
+  let b0 = a0;
+  ${Array.from({ length: depth }, () => "b0 = flag ? b0.v : a0;").join("")}
+  return b0();
+}`);
+    const choose = context.state.program.body[1];
+    if (!t.isFunctionDeclaration(choose)) throw new Error("Missing choose");
+    const last = choose.body.body.at(-1);
+    if (!t.isReturnStatement(last) || !t.isCallExpression(last.argument))
+      throw new Error("Missing call");
+    const lookups = context.state.scopes.map((scope) =>
+      vi.spyOn(scope.bindings, "get"),
+    );
+    try {
+      const references = createSemanticReturnedReferences(context.state)(
+        last.argument.callee,
+      );
+      expect(references.length).toBeGreaterThan(0);
+      return lookups.reduce(
+        (total, lookup) => total + lookup.mock.calls.length,
+        0,
+      );
+    } finally {
+      for (const lookup of lookups) lookup.mockRestore();
+    }
+  };
+  const small = measure(8);
+  const large = measure(12);
+  expect(small).toBeGreaterThan(0);
+  expect(large).toBeLessThan(3 * small);
 });
 
 it.each([
@@ -221,7 +306,6 @@ it("does not memoize alias cycle cuts across entry paths", () => {
       state: context.state,
       callableById: context.callableById,
       bindingCache: new WeakMap(),
-      seenInitializers: new Set(),
     });
     expect(warm).toEqual(cold);
     expect(warm).toMatchObject({
